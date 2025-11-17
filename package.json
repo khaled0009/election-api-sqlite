@@ -1,0 +1,26 @@
+{
+  "name": "election-excel-api",
+  "version": "3.0.0",
+  "description": "High-performance DB-based fuzzy name lookup API (Arabic)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "excel",
+    "api",
+    "fuzzy-search",
+    "arabic",
+    "names"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "body-parser": "^2.2.0",
+    "express": "^5.1.0",
+    "xlsx": "^0.18.5",
+    "fuse.js": "^6.6.2",
+    "better-sqlite3": "^11.0.0"
+  }
+}
