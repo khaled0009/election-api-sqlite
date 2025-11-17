@@ -1,79 +1,111 @@
 /**
- * Election DB API v3.1 - SQLite + Queue Edition
+ * Election DB API v3.2 - SQLite Direct Search Edition
  *
- * - قراءة الأسماء من ملف SQLite .db بدل Excel
- * - بناء Index في الذاكرة باستخدام Fuse.js (نفس منطق v3)
- * - بحث Fuzzy يدعم الأخطاء الإملائية البسيطة في الأسماء
- * - يرجّع نفس شكل الـ JSON المذكور في README (ok / name_column / total_matches / count / results[])
- * - Cache للطلبات المتكررة
- * - طابور انتظار لتنظيم آلاف الطلبات (MAX_CONCURRENT في نفس الوقت)
+ * - Direct SQLite search without loading all data into memory
+ * - Maintains same API interface and JSON response format
+ * - Supports partial search with Arabic normalization
+ * - Queue system for managing concurrent requests
+ * - Professional English logging with request/response tracking
  */
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
-const Fuse = require("fuse.js");
 const Database = require("better-sqlite3");
 
-// ==================== إعدادات عامة ====================
+// ==================== Configuration ====================
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "supersecretkey";
 const LOG_FILE = "./log.txt";
 
-// مسار ملف SQLite واسم الجدول
-// مثال: data/db.sqlite وجدول اسمه voters
-const DB_PATH =
-  process.env.DB_PATH || path.join(__dirname, "data", "data.db");
-const DB_TABLE = process.env.DB_TABLE || "Sheet1"; // غيّره لو اسم الجدول مختلف
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "data", "data.db");
+const DB_TABLE = process.env.DB_TABLE || "Sheet1";
 
-// إعدادات الكاش
-const CACHE_TTL_MS = 60 * 1000; // 60 ثانية
-const cache = new Map(); // key → { ts, data }
+// Cache settings
+const CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const cache = new Map();
 
-// إعدادات الطابور
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 10); // أقصى عدد طلبات تتنفذ في نفس الوقت
+// Queue settings
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 10);
 let activeRequests = 0;
 const requestQueue = [];
 
-// ==================== دوال مساعدة ====================
+// Request tracking
+let requestCounter = 0;
+
+// ==================== Helper Functions ====================
 function log(message) {
-  const line = `[${new Date().toLocaleString()}] ${message}\n`;
+  const line = `[${new Date().toISOString()}] ${message}\n`;
   console.log(line.trim());
   try {
     fs.appendFileSync(LOG_FILE, line, "utf8");
   } catch (e) {
-    // لو في مشكلة في اللوج، ما نوقفش السيرفر
     console.error("Log write error:", e.message);
   }
 }
 
-// تطبيع الحروف العربية وإزالة التشكيل وعلامات الاتجاه
+function generateRequestId() {
+  return `REQ-${Date.now()}-${(++requestCounter).toString().padStart(6, '0')}`;
+}
+
 function normalizeArabic(str = "") {
   return String(str)
-    // إزالة علامات الاتجاه / التحكم
-    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
-    // إزالة التشكيل العربي كله
-    .replace(/[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]/g, "")
-    // توحيد أشكال الألف
-    .replace(/[أإآا]/g, "ا")
-    // توحيد الياء والألف المقصورة
-    .replace(/[ىی]/g, "ي")
-    // توحيد الهمزات على واو/ياء
-    .replace(/ؤ/g, "و")
-    .replace(/ئ/g, "ي");
+      .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "") // Remove directional marks
+      .replace(/[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]/g, "") // Remove diacritics
+      .replace(/[أإآا]/g, "ا") // Normalize alef variations
+      .replace(/[ىی]/g, "ي") // Normalize yaa variations
+      .replace(/ؤ/g, "و") // Normalize waw with hamza
+      .replace(/ئ/g, "ي") // Normalize yaa with hamza
+      .replace(/ة/g, "ه"); // Normalize taa marbouta
 }
 
 function normalizeText(str = "") {
   return normalizeArabic(str)
-    .replace(/[ـ]/g, "") // مدّة
-    .replace(/[^\p{Letter}\p{Number}\s]/gu, "") // أي رموز غريبة
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+      .replace(/[ـ]/g, "") // Remove tatweel
+      .replace(/[^\p{Letter}\p{Number}\s]/gu, "") // Keep only letters, numbers, spaces
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
 }
 
-// اكتشاف عمود الاسم من أول صف (نفس فكرة v3)
+// ==================== Database Management ====================
+let db = null;
+let NAME_KEY = null;
+let TOTAL_RECORDS = 0;
+
+function initDatabase() {
+  log(`INFO: Initializing database connection to: ${DB_PATH}`);
+
+  if (!fs.existsSync(DB_PATH)) {
+    throw new Error(`Database file not found: ${DB_PATH}`);
+  }
+
+  // Open read-only connection
+  db = new Database(DB_PATH, { readonly: true });
+  log("INFO: SQLite database connection established");
+
+  // Get total record count
+  const countStmt = db.prepare(`SELECT COUNT(*) as count FROM ${DB_TABLE}`);
+  TOTAL_RECORDS = countStmt.get().count;
+  log(`INFO: Total records in table '${DB_TABLE}': ${TOTAL_RECORDS}`);
+
+  // Detect name column from first record
+  const firstRow = db.prepare(`SELECT * FROM ${DB_TABLE} LIMIT 1`).get();
+  if (!firstRow) {
+    throw new Error(`Table '${DB_TABLE}' contains no data`);
+  }
+
+  NAME_KEY = detectNameColumn(firstRow);
+  if (!NAME_KEY) {
+    throw new Error(
+        `Failed to detect name column in table '${DB_TABLE}'. Ensure column exists with name like 'الأسم', 'الاسم', or 'name'`
+    );
+  }
+
+  log(`INFO: Database initialized successfully | Name column: '${NAME_KEY}' | Total records: ${TOTAL_RECORDS}`);
+}
+
 function detectNameColumn(row) {
   const keys = Object.keys(row);
   if (!keys.length) return null;
@@ -89,81 +121,14 @@ function detectNameColumn(row) {
     }
   }
 
-  // fallback: أي عمود اسمه فيه "اسم" بعد التطبيع
   const fallback = keys.find((k) => normalizeText(k).includes("اسم"));
   return fallback || null;
 }
 
-// ==================== تحميل الـ DB وبناء الـ Index ====================
-let DB = [];
-let DB_READY = false;
-let NAME_KEY = null;
-let FUSE = null;
-
-function loadDatabaseFromSqlite(dbPath, tableName) {
-  log(`📊 جاري تحميل قاعدة البيانات من SQLite: ${dbPath} (الجدول: ${tableName})`);
-
-  if (!fs.existsSync(dbPath)) {
-    throw new Error(`ملف SQLite غير موجود: ${dbPath}`);
-  }
-
-  // فتح قاعدة البيانات للقراءة فقط
-  const db = new Database(dbPath, { readonly: true });
-
-  // قراءة كل السجلات من الجدول
-  const stmt = db.prepare(`SELECT * FROM ${tableName}`);
-  const rows = stmt.all();
-
-  if (!rows.length) {
-    db.close();
-    throw new Error(`الجدول "${tableName}" لا يحتوي على بيانات`);
-  }
-
-  NAME_KEY = detectNameColumn(rows[0]);
-  if (!NAME_KEY) {
-    db.close();
-    throw new Error(
-      `تعذر تحديد عمود الاسم في الجدول "${tableName}". تأكد أن هناك عمود باسم 'الأسم' أو 'الاسم' أو 'name'`
-    );
-  }
-
-  DB = rows.map((row, index) => {
-    const name = row[NAME_KEY] || "";
-    const norm = normalizeText(name);
-    return {
-      __id: index + 1, // معرف داخلي
-      __name: name, // الاسم الأصلي كما في الـ DB
-      searchName: norm, // اسم مُطَبَّع للبحث
-      ...row // كل الأعمدة كما هي من الجدول
-    };
-  });
-
-  log(
-    `✅ تم تحميل قاعدة البيانات من SQLite: عدد السجلات = ${DB.length} ، عمود الاسم = "${NAME_KEY}"`
-  );
-
-  // بناء Index باستخدام Fuse.js (نفس إعدادات v3 تقريبًا)
-  const fuseOptions = {
-    includeScore: true,
-    keys: ["searchName"],
-    threshold: 0.4, // كلما قلّ الرقم كان البحث أدق (0 = تطابق تام)
-    ignoreLocation: true, // ما نهتمش بمكان المطابقة في النص
-    minMatchCharLength: 2 // أقل طول مقبول للنمط
-  };
-
-  FUSE = new Fuse(DB, fuseOptions);
-
-  log("⚙️ تم بناء Index للبحث باستخدام Fuse.js");
-  DB_READY = true;
-
-  // خلاص مش محتاجين اتصال مفتوح
-  db.close();
-}
-
-// ==================== البحث بالاسم مع كاش (نفس المنطق العام) ====================
-function searchByName(name, maxResults = 5) {
-  if (!DB_READY || !FUSE) {
-    throw new Error("قاعدة البيانات غير جاهزة بعد");
+// ==================== Direct SQLite Search ====================
+function searchByName(name, maxResults = 5, requestId = '') {
+  if (!db || !NAME_KEY) {
+    throw new Error("Database not ready");
   }
 
   const queryNorm = normalizeText(name);
@@ -174,111 +139,164 @@ function searchByName(name, maxResults = 5) {
   const cacheKey = `${queryNorm}::${maxResults}`;
   const now = Date.now();
 
-  // كاش للطلبات المتكررة
+  // Check cache
   const cached = cache.get(cacheKey);
   if (cached && now - cached.ts < CACHE_TTL_MS) {
+    log(`INFO: [${requestId}] Cache hit for query: '${name}'`);
     return cached.data;
   }
 
-  // نطلب عدد أكبر داخليًا ثم نقصّه
-  const fuseLimit = Math.max(maxResults, 10);
-  const fuseResults = FUSE.search(queryNorm, { limit: fuseLimit });
+  log(`INFO: [${requestId}] Executing database search for: '${name}'`);
 
-  const mapped = fuseResults.map((item) => {
-    const rec = item.item;
-    const score = item.score != null ? item.score : 0;
-    const simScore = 1 - Math.min(Math.max(score, 0), 1); // تحويل 0=أفضل → 1=أفضل
+  // Split name into parts for flexible search
+  const nameParts = queryNorm.split(' ').filter(part => part.length > 1);
 
-    return {
-      __score: Number(simScore.toFixed(3)),
-      ...rec
-    };
+  // Build SQL query with LIKE for each part
+  let conditions = [];
+  let params = [];
+
+  // Search for each part of the name
+  nameParts.forEach(part => {
+    conditions.push(`LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${NAME_KEY}, 'أ', 'ا'), 'إ', 'ا'), 'آ', 'ا'), 'ى', 'ي'), 'ة', 'ه')) LIKE ?`);
+    params.push(`%${part}%`);
   });
 
-  const totalMatches = mapped.length;
-  const top = mapped.slice(0, maxResults);
+  // Query to get results
+  const query = `
+    SELECT * FROM ${DB_TABLE}
+    WHERE ${conditions.join(' AND ')}
+    LIMIT ${maxResults * 2}
+  `;
 
-  const data = { totalMatches, results: top };
-  cache.set(cacheKey, { ts: now, data });
+  try {
+    const startTime = Date.now();
+    const stmt = db.prepare(query);
+    const results = stmt.all(...params);
+    const queryTime = Date.now() - startTime;
 
-  return data;
+    log(`INFO: [${requestId}] Database query executed in ${queryTime}ms | Found ${results.length} records`);
+
+    // Calculate match score for each result
+    const scoredResults = results.map((row, index) => {
+      const rowName = normalizeText(row[NAME_KEY] || '');
+      let score = 0;
+
+      // Calculate score based on matching parts
+      nameParts.forEach(part => {
+        if (rowName.includes(part)) {
+          score += 1 / nameParts.length;
+        }
+      });
+
+      // Bonus for exact match
+      if (rowName === queryNorm) {
+        score = 1;
+      }
+
+      return {
+        __score: Number(score.toFixed(3)),
+        __id: index + 1,
+        ...row,
+        searchName: rowName // For backward compatibility
+      };
+    });
+
+    // Sort by score and take requested number
+    scoredResults.sort((a, b) => b.__score - a.__score);
+    const topResults = scoredResults.slice(0, maxResults);
+
+    const data = {
+      totalMatches: results.length,
+      results: topResults
+    };
+
+    // Save to cache
+    cache.set(cacheKey, { ts: now, data });
+    log(`INFO: [${requestId}] Results cached for future queries`);
+
+    return data;
+  } catch (err) {
+    log(`ERROR: [${requestId}] Database search failed: ${err.message}`);
+    throw err;
+  }
 }
 
-// ==================== طابور الانتظار ====================
+// ==================== Request Queue ====================
 function processQueue() {
-  // شغّل لحد ما نوصل للحد الأقصى المتوازي
   while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
     const task = requestQueue.shift();
     activeRequests++;
 
     task()
-      .catch((err) => {
-        log(`❌ خطأ غير متوقع داخل مهمة في الطابور: ${err.message}`);
-      })
-      .finally(() => {
-        activeRequests--;
-        processQueue(); // شغّل اللي بعده
-      });
+        .catch((err) => {
+          log(`ERROR: Queue task failed: ${err.message}`);
+        })
+        .finally(() => {
+          activeRequests--;
+          processQueue();
+        });
   }
 }
 
 function enqueueRequest(task) {
   requestQueue.push(task);
-  log(
-    `🕓 تمت إضافة استعلام جديد للطابور (الطول الحالي: ${requestQueue.length} | النشط حاليًا: ${activeRequests})`
-  );
+  log(`INFO: Request queued | Queue length: ${requestQueue.length} | Active requests: ${activeRequests}`);
   processQueue();
 }
 
-// ==================== إعداد السيرفر ====================
+// ==================== Express Server Setup ====================
 const app = express();
 app.use(bodyParser.json());
 
-// Middleware للتحقق من الـ API Key (نفس الفكرة)
+// Middleware for API key validation
 app.use((req, res, next) => {
+  // Skip API key check for health check endpoint
+  if (req.path === '/') {
+    return next();
+  }
+
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) {
-    log(`🚫 محاولة دخول غير مصرح بها من ${req.ip}`);
+    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    log(`WARN: Unauthorized access attempt from IP: ${ip} | Path: ${req.path}`);
     return res.status(403).json({ ok: false, message: "Invalid API key" });
   }
   next();
 });
 
-// Endpoint رئيسي للاستعلام بالاسم (يدخل الطابور)
+// Main query endpoint
 app.post("/query", (req, res) => {
+  const requestId = generateRequestId();
+  const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const startTime = Date.now();
+
+  // Log incoming request
+  log(`INFO: [${requestId}] Incoming request from ${clientIp} | Body: ${JSON.stringify(req.body)}`);
+
   const { name, limit } = req.body;
 
+  // Validate input
   if (!name || typeof name !== "string" || name.trim().length < 2) {
-    log(`⚠️ طلب غير صالح: ${JSON.stringify(req.body)}`);
+    const errorMsg = "Name is required and must be at least 2 characters";
+    log(`WARN: [${requestId}] Invalid request: ${errorMsg}`);
     return res
-      .status(400)
-      .json({ ok: false, message: "الاسم مطلوب ويجب ألا يقل عن حرفين" });
+        .status(400)
+        .json({ ok: false, message: errorMsg });
   }
 
   const maxResults =
-    typeof limit === "number" && limit > 0 && limit <= 50 ? limit : 5;
+      typeof limit === "number" && limit > 0 && limit <= 50 ? limit : 5;
 
   enqueueRequest(async () => {
     try {
-      if (!DB_READY) {
-        log("⚠️ طلب وارد قبل جاهزية قاعدة البيانات");
-        if (!res.headersSent) {
-          res.status(503).json({
-            ok: false,
-            message:
-              "قاعدة البيانات لم تجهز بعد، تأكد من وجود ملف DB الصحيح وإعادة تشغيل السيرفر"
-          });
-        }
-        return;
-      }
+      log(`INFO: [${requestId}] Processing query for name: '${name}' | Limit: ${maxResults}`);
 
-      const { totalMatches, results } = searchByName(name, maxResults);
-      log(
-        `🔎 استعلام بالاسم: "${name}" → إجمالي مطابقات تقريبية: ${totalMatches} | المعاد: ${results.length}`
-      );
+      const { totalMatches, results } = searchByName(name, maxResults, requestId);
+      const processingTime = Date.now() - startTime;
+
+      log(`INFO: [${requestId}] Query completed successfully | Total matches: ${totalMatches} | Returned: ${results.length} | Processing time: ${processingTime}ms`);
 
       if (!res.headersSent) {
-        // نفس شكل الـ JSON الموجود في README
         res.json({
           ok: true,
           name_column: NAME_KEY,
@@ -286,36 +304,72 @@ app.post("/query", (req, res) => {
           count: results.length,
           results
         });
+
+        log(`INFO: [${requestId}] Response sent successfully | Status: 200`);
       }
     } catch (err) {
-      log(`❌ خطأ أثناء البحث بالاسم "${name}": ${err.message}`);
+      const processingTime = Date.now() - startTime;
+      log(`ERROR: [${requestId}] Query failed for name: '${name}' | Error: ${err.message} | Processing time: ${processingTime}ms`);
+
       if (!res.headersSent) {
         res
-          .status(500)
-          .json({ ok: false, message: "حدث خطأ أثناء تنفيذ الاستعلام" });
+            .status(500)
+            .json({ ok: false, message: "An error occurred while processing the query" });
+
+        log(`INFO: [${requestId}] Error response sent | Status: 500`);
       }
     }
   });
 });
 
-// Endpoint بسيط للفحص
-app.get("/", (req, res) =>
+// Health check endpoint
+app.get("/", (req, res) => {
+  const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  log(`INFO: Health check request from ${clientIp}`);
   res.send(
-    "✅ Election DB API v3.1 جاهز. استخدم POST /query مع x-api-key و name. (مصدر البيانات: SQLite + طابور انتظار)"
-  )
-);
+      "✅ Election DB API v3.2 is running. Use POST /query with x-api-key and name."
+  );
+});
 
-// ==================== بدء التشغيل ====================
+// ==================== Server Startup ====================
 app.listen(PORT, () => {
-  log(`🚀 السيرفر شغال على http://localhost:${PORT}`);
-  log(`🔑 استخدم API Key: ${API_KEY}`);
-  log(`📁 DB_PATH = ${DB_PATH} | DB_TABLE = ${DB_TABLE}`);
-  log(`📌 MAX_CONCURRENT = ${MAX_CONCURRENT}`);
+  log("=====================================");
+  log("INFO: Election DB API v3.2 Starting");
+  log("=====================================");
+  log(`INFO: Server running on http://localhost:${PORT}`);
+  log(`INFO: API Key configured: ${API_KEY.substring(0, 4)}****`);
+  log(`INFO: Database path: ${DB_PATH}`);
+  log(`INFO: Database table: ${DB_TABLE}`);
+  log(`INFO: Max concurrent requests: ${MAX_CONCURRENT}`);
 
   try {
-    loadDatabaseFromSqlite(DB_PATH, DB_TABLE);
+    initDatabase();
+    log("INFO: Server startup completed successfully");
+    log("=====================================");
   } catch (err) {
-    log(`❌ فشل تحميل قاعدة البيانات من SQLite: ${err.message}`);
-    DB_READY = false;
+    log(`ERROR: Failed to initialize database: ${err.message}`);
+    log("ERROR: Server startup failed - exiting");
+    process.exit(1);
   }
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  log('INFO: Received SIGINT signal, initiating graceful shutdown');
+  if (db) {
+    db.close();
+    log('INFO: Database connection closed');
+  }
+  log('INFO: Server shutdown completed');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  log('INFO: Received SIGTERM signal, initiating graceful shutdown');
+  if (db) {
+    db.close();
+    log('INFO: Database connection closed');
+  }
+  log('INFO: Server shutdown completed');
+  process.exit(0);
 });
